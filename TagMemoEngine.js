@@ -410,37 +410,93 @@ class TagMemoEngine {
     _buildBoundedV83PropagationKernel(v83Matrix, residualMap, config = {}) {
         const kernel = new Map();
         const wormholeEdges = new Set();
-        const outboundMass = Math.max(0.01, Math.min(1, Number(config.outboundMass ?? 0.95)));
         const tensionThreshold = Math.max(0, Number(config.tensionThreshold ?? 1.0));
+        const minOutboundMass = Math.max(0.01, Number(config.minOutboundMass ?? 0.70));
+        const maxOutboundMass = Math.max(
+            minOutboundMass,
+            Math.min(1.40, Number(config.maxOutboundMass ?? 1.20))
+        );
 
+        // 第一遍：从原始累计矩阵提取每个节点的历史流量质量。
+        // log 压缩后使用 median/MAD，避免少数超级枢纽决定全图预算尺度。
+        const rawRows = new Map();
+        const logRowMasses = [];
         for (const [sourceId, edges] of v83Matrix.entries()) {
             if (!(edges instanceof Map) || edges.size === 0) continue;
 
+            const positiveEdges = [];
             let rowSum = 0;
-            for (const weight of edges.values()) {
-                const numericWeight = Math.max(0, Number(weight) || 0);
-                rowSum += numericWeight;
-            }
-            if (!Number.isFinite(rowSum) || rowSum <= 0) continue;
-
-            const normalizedEdges = new Map();
             for (const [targetId, weight] of edges.entries()) {
                 const rawWeight = Math.max(0, Number(weight) || 0);
                 if (rawWeight <= 0) continue;
+                positiveEdges.push([targetId, rawWeight]);
+                rowSum += rawWeight;
+            }
+            if (!Number.isFinite(rowSum) || rowSum <= 0 || positiveEdges.length === 0) continue;
 
-                // 虫洞身份沿用 V8.3 原始累计权重判定；只修复传播电流尺度，
-                // 避免归一化后阈值口径变化导致虫洞机制被意外关闭。
+            const logRowMass = Math.log1p(rowSum);
+            rawRows.set(sourceId, { positiveEdges, rowSum, logRowMass });
+            logRowMasses.push(logRowMass);
+        }
+
+        const medianOfSorted = values => {
+            if (values.length === 0) return 0;
+            const mid = Math.floor(values.length / 2);
+            return values.length % 2 === 0
+                ? (values[mid - 1] + values[mid]) / 2
+                : values[mid];
+        };
+        logRowMasses.sort((a, b) => a - b);
+        const medianLogRowMass = medianOfSorted(logRowMasses);
+        const deviations = logRowMasses
+            .map(value => Math.abs(value - medianLogRowMass))
+            .sort((a, b) => a - b);
+        const madLogRowMass = medianOfSorted(deviations);
+        const robustScale = madLogRowMass > 1e-9 ? 1.4826 * madLogRowMass : 1.0;
+
+        // 第二遍：历史质量只控制有界节点总预算；行内仍保留 V8.3 的线性累计比例。
+        let observedMinMass = Infinity;
+        let observedMaxMass = 0;
+        let totalMass = 0;
+        for (const [sourceId, row] of rawRows.entries()) {
+            const robustZ = (row.logRowMass - medianLogRowMass) / robustScale;
+            const sigmoid = 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, robustZ))));
+            const nodeOutboundMass = minOutboundMass
+                + (maxOutboundMass - minOutboundMass) * sigmoid;
+            observedMinMass = Math.min(observedMinMass, nodeOutboundMass);
+            observedMaxMass = Math.max(observedMaxMass, nodeOutboundMass);
+            totalMass += nodeOutboundMass;
+
+            const normalizedEdges = new Map();
+            for (const [targetId, rawWeight] of row.positiveEdges) {
+                // 虫洞身份沿用 V8.3 原始累计权重判定；自适应预算只修复传播尺度，
+                // 不改变原虫洞、逆流和线性流量偏好。
                 const residual = residualMap?.get(targetId) ?? 1.0;
                 if (rawWeight * residual >= tensionThreshold) {
                     wormholeEdges.add(`${sourceId}:${targetId}`);
                 }
-
-                normalizedEdges.set(targetId, outboundMass * rawWeight / rowSum);
+                normalizedEdges.set(targetId, nodeOutboundMass * rawWeight / row.rowSum);
             }
-            if (normalizedEdges.size > 0) kernel.set(sourceId, normalizedEdges);
+            kernel.set(sourceId, normalizedEdges);
         }
 
-        return { kernel, wormholeEdges, outboundMass };
+        const nominalOutboundMass = (minOutboundMass + maxOutboundMass) / 2;
+        return {
+            kernel,
+            wormholeEdges,
+            outboundMass: nominalOutboundMass,
+            kernelDiagnostics: Object.freeze({
+                algorithmVersion: 'v8.3-bounded-adaptive-flow',
+                minOutboundMass,
+                maxOutboundMass,
+                medianLogRowMass,
+                madLogRowMass,
+                observedMinMass: Number.isFinite(observedMinMass) ? observedMinMass : 0,
+                observedMaxMass,
+                averageOutboundMass: rawRows.size > 0 ? totalMass / rawRows.size : 0,
+                sourceCount: rawRows.size
+            })
+        };
     }
 
     _stageAndPublishDualBundles(v83Matrix) {
@@ -458,8 +514,10 @@ class TagMemoEngine {
         ));
         const versionConfig = kbConfig.tagMemoVersioning || {};
         const v9Config = kbConfig.v9 || {};
+        const configuredV83 = kbConfig.v8_3 || {};
         const v83Config = {
-            outboundMass: v9Config.outboundMass ?? 0.95,
+            minOutboundMass: configuredV83.minOutboundMass ?? 0.70,
+            maxOutboundMass: configuredV83.maxOutboundMass ?? 1.20,
             tensionThreshold: kbConfig.spikeRouting?.tensionThreshold ?? 1.0
         };
         const potentialFieldConfig = kbConfig.potentialFieldRerank
@@ -503,7 +561,9 @@ class TagMemoEngine {
         return this._publishArtifactBundles({
             v8_3: makeStaging('v8_3', v83Generation, v83ResidualMap, v83Build.kernel, {
                 wormholeEdges: v83Build.wormholeEdges,
-                outboundMass: v83Build.outboundMass
+                outboundMass: v83Build.outboundMass,
+                kernelDiagnostics: v83Build.kernelDiagnostics,
+                algorithmVersion: 'v8.3-bounded-adaptive-flow'
             }),
             v9: makeStaging('v9', v9Generation, v9ResidualMap, v9Build.kernel, {
                 wormholeEdges: v9Build.wormholeEdges,
