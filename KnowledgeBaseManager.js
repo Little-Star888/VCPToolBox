@@ -99,6 +99,9 @@ class KnowledgeBaseManager {
         this.diaryDateIndexCache = new Map();
         this.pendingFiles = new Set();
         this.fileRetryCount = new Map(); // 🛡️ 文件重试计数器，防止无限循环
+        // Rust watcher 稳定事件代际：同一路径只接受严格更新的 generation。
+        this.watcherPathGenerations = new Map();
+        this.staleWatcherEventsDropped = 0;
         this.batchTimer = null;
         this.isProcessing = false;
         this.saveTimers = new Map();
@@ -115,6 +118,19 @@ class KnowledgeBaseManager {
         this.lastJsWriteFinishedAt = 0;
         this.lastRustWriteFinishedAt = 0;
         this._rustLeaseWaitLogAt = 0;
+
+        // 🧭 外部文件写入协调器（DailyNote 等常驻服务使用）
+        // 文件变更本身不直接写 SQLite，但必须与 watcher 批处理、Rust SQLite 恢复形成单一时序。
+        this.externalMutationActive = false;
+        this.externalMutationOwner = null;
+        this.externalMutationQueueLength = 0;
+        this._externalMutationTail = Promise.resolve();
+
+        // 🛡️ 同一时刻只允许一个 Rust recoverFromSqlite 打开知识库。
+        // diaryIndexLoadPromises 去重同一日记本；_indexRecoveryTail 串行化不同日记本。
+        this.diaryIndexLoadPromises = new Map();
+        this.indexRecoveryActive = false;
+        this._indexRecoveryTail = Promise.resolve();
 
     }
 
@@ -584,6 +600,179 @@ class KnowledgeBaseManager {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    async _waitForDatabaseCoordinatorIdle(options = {}) {
+        const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 30 * 60 * 1000);
+        const pollMs = Math.max(10, Number(options.pollMs) || 50);
+        const startedAt = Date.now();
+
+        while (
+            (!options.allowJsProcessing && this.isProcessing) ||
+            (!options.allowJsDeleteProcessing && this.isProcessingDeletes) ||
+            (!options.allowExternalMutation && this.externalMutationActive) ||
+            this.rustWriteLease ||
+            this.indexRecoveryActive ||
+            this.dbHealthState === 'recovering'
+        ) {
+            if (this.databaseCorruptionDetected || this.dbHealthState === 'corrupt') {
+                throw new Error('KnowledgeBase database is unavailable because corruption was detected.');
+            }
+            if (options.signal?.aborted) {
+                const error = new Error('External file mutation was aborted while waiting for KnowledgeBase.');
+                error.code = 'ABORT_ERR';
+                throw error;
+            }
+            if (Date.now() - startedAt >= timeoutMs) {
+                throw new Error(
+                    `Timed out waiting for KnowledgeBase coordinator after ${timeoutMs}ms ` +
+                    `(processing=${this.isProcessing}, deletes=${this.isProcessingDeletes}, ` +
+                    `externalMutation=${this.externalMutationOwner || 'none'}, ` +
+                    `rustLease=${this.rustWriteLease?.owner || 'none'}, recovery=${this.indexRecoveryActive}).`
+                );
+            }
+            await this._delay(pollMs);
+        }
+    }
+
+    _extractMutationPaths(result) {
+        const upserts = new Set();
+        const deletes = new Set();
+        const addSafePath = (collection, value) => {
+            if (typeof value !== 'string' || !value.trim()) return;
+            const resolved = path.resolve(value);
+            const relative = path.relative(this.config.rootPath, resolved);
+            if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+                collection.add(resolved);
+            }
+        };
+        const visit = value => {
+            if (!value || typeof value !== 'object') return;
+            addSafePath(upserts, value.targetFile);
+            if (
+                typeof value.folder === 'string' &&
+                typeof value.fileName === 'string' &&
+                value.folder.trim() &&
+                value.fileName.trim()
+            ) {
+                addSafePath(upserts, path.resolve(this.config.rootPath, value.folder, value.fileName));
+            }
+            if (value.mutationPaths && typeof value.mutationPaths === 'object') {
+                for (const filePath of value.mutationPaths.upserts || []) addSafePath(upserts, filePath);
+                for (const filePath of value.mutationPaths.deletes || []) addSafePath(deletes, filePath);
+            }
+            if (value.result && typeof value.result === 'object') visit(value.result);
+        };
+        visit(result);
+        return {
+            upserts: [...upserts],
+            deletes: [...deletes]
+        };
+    }
+
+    async _awaitIndexedFilePaths(filePaths, options = {}) {
+        if (!Array.isArray(filePaths) || filePaths.length === 0) return;
+        const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 30 * 60 * 1000);
+        const startedAt = Date.now();
+
+        for (const filePath of filePaths) {
+            this.pendingFiles.add(filePath);
+        }
+        this._scheduleBatch();
+
+        while (true) {
+            if (this.databaseCorruptionDetected || this.dbHealthState === 'corrupt') {
+                throw new Error('KnowledgeBase indexing stopped because database corruption was detected.');
+            }
+            if (options.signal?.aborted) {
+                const error = new Error('External file mutation was aborted while waiting for indexing.');
+                error.code = 'ABORT_ERR';
+                throw error;
+            }
+
+            const stillPending = filePaths.some(filePath => this.pendingFiles.has(filePath));
+            if (!stillPending && !this.isProcessing) return;
+
+            if (Date.now() - startedAt >= timeoutMs) {
+                throw new Error(`Timed out waiting for ${filePaths.length} mutated diary file(s) to be indexed.`);
+            }
+            await this._delay(50);
+        }
+    }
+
+    async _awaitDeletedFilePaths(filePaths, options = {}) {
+        if (!Array.isArray(filePaths) || filePaths.length === 0) return;
+        const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 30 * 60 * 1000);
+        const startedAt = Date.now();
+
+        for (const filePath of filePaths) {
+            this.pendingFiles.delete(filePath);
+            this.pendingDeletes.add(filePath);
+        }
+        this._scheduleDeleteBatch();
+
+        while (true) {
+            if (this.databaseCorruptionDetected || this.dbHealthState === 'corrupt') {
+                throw new Error('KnowledgeBase deletion stopped because database corruption was detected.');
+            }
+            if (options.signal?.aborted) {
+                const error = new Error('External file mutation was aborted while waiting for deletion indexing.');
+                error.code = 'ABORT_ERR';
+                throw error;
+            }
+
+            const stillPending = filePaths.some(filePath => this.pendingDeletes.has(filePath));
+            if (!stillPending && !this.isProcessingDeletes) return;
+            if (Date.now() - startedAt >= timeoutMs) {
+                throw new Error(`Timed out waiting for ${filePaths.length} deleted diary file(s) to leave the index.`);
+            }
+            await this._delay(50);
+        }
+    }
+
+    /**
+     * 常驻写入插件的公共协调入口。
+     * 1. 所有外部 mutation FIFO 串行；
+     * 2. 写文件前等待 JS/Rust 数据库任务空闲；
+     * 3. 写文件后主动送入 watcher 队列并等待 SQLite/Vexus 更新完成；
+     * 4. 下一项 mutation 只有在上一项完成入库后才开始。
+     */
+    runExternalFileMutation(owner, operation, options = {}) {
+        if (typeof operation !== 'function') {
+            return Promise.reject(new TypeError('operation must be a function'));
+        }
+
+        this.externalMutationQueueLength++;
+        const execute = async () => {
+            await this._waitForDatabaseCoordinatorIdle(options);
+            this.externalMutationActive = true;
+            this.externalMutationOwner = owner || 'external-file-mutation';
+
+            let result;
+            try {
+                result = await operation();
+            } finally {
+                // 必须先释放 mutation 门控，_flushBatch 才能消费刚写入的文件。
+                this.externalMutationActive = false;
+                this.externalMutationOwner = null;
+            }
+
+            if (result?.status === 'success' || result?.status === 'partial') {
+                const mutationPaths = this._extractMutationPaths(result);
+                // 先删除旧路径，再提交新路径，正确表达 move/rename 的最终文件真相。
+                await this._awaitDeletedFilePaths(mutationPaths.deletes, options);
+                await this._awaitIndexedFilePaths(mutationPaths.upserts, options);
+            }
+            return result;
+        };
+
+        const task = this._externalMutationTail.then(execute);
+        this._externalMutationTail = task.catch(error => {
+            console.error(`[KnowledgeBase] External mutation "${owner}" failed:`, error);
+        }).finally(() => {
+            this.externalMutationQueueLength = Math.max(0, this.externalMutationQueueLength - 1);
+        });
+        return task;
+    }
+
     _startEventLoopWatchdog() {
         if (this.eventLoopWatchdogTimer) return;
 
@@ -911,32 +1100,64 @@ class KnowledgeBaseManager {
     }
 
     // 🏭 索引工厂
-    async _getOrLoadDiaryIndex(diaryName) {
+    async _getOrLoadDiaryIndex(diaryName, options = {}) {
         // 🌟 每次访问都刷新最后使用时间
         this.diaryIndexLastUsed.set(diaryName, Date.now());
         if (this.diaryIndices.has(diaryName)) {
             return this.diaryIndices.get(diaryName);
         }
 
-        const shouldPersist = this.config.persistDefault || this.config.persistFolders.has(diaryName) || diaryName.endsWith('簇');
-        console.log(`[KnowledgeBase] 📂 Loading index for diary: "${diaryName}" (Persist: ${shouldPersist})`);
-
-        const safeName = crypto.createHash('md5').update(diaryName).digest('hex');
-        const fileName = `diary_${safeName}`;
-        const capacity = 50000;
-
-        let idx;
-        if (shouldPersist) {
-            idx = await this._loadOrBuildIndex(fileName, capacity, 'chunks', diaryName);
-        } else {
-            // 🚀 核心改动：非持久化文件夹直接在内存重建
-            idx = new VexusIndex(this.config.dimension, capacity);
-            await this._recoverIndexFromDB(idx, 'chunks', diaryName);
+        // 同一日记本 single-flight：多个 Agent 同时回忆时共享同一个加载 Promise。
+        if (this.diaryIndexLoadPromises.has(diaryName)) {
+            return this.diaryIndexLoadPromises.get(diaryName);
         }
 
-        this.diaryIndices.set(diaryName, idx);
-        this._ensureDiaryDateIndexCached(diaryName);
-        return idx;
+        const loadIndex = async () => {
+            // 不同日记本也全局串行恢复，避免多个 Rust/rusqlite 连接同时持有恢复队列。
+            await this._waitForDatabaseCoordinatorIdle(options);
+            this.indexRecoveryActive = true;
+            try {
+                // 等待队列期间可能已被前一项加载。
+                if (this.diaryIndices.has(diaryName)) {
+                    return this.diaryIndices.get(diaryName);
+                }
+
+                const shouldPersist = this.config.persistDefault || this.config.persistFolders.has(diaryName) || diaryName.endsWith('簇');
+                console.log(`[KnowledgeBase] 📂 Loading index for diary: "${diaryName}" (Persist: ${shouldPersist})`);
+
+                const safeName = crypto.createHash('md5').update(diaryName).digest('hex');
+                const fileName = `diary_${safeName}`;
+                const capacity = 50000;
+
+                let idx;
+                if (shouldPersist) {
+                    idx = await this._loadOrBuildIndex(fileName, capacity, 'chunks', diaryName);
+                } else {
+                    idx = new VexusIndex(this.config.dimension, capacity);
+                    await this._recoverIndexFromDB(idx, 'chunks', diaryName);
+                }
+
+                this.diaryIndices.set(diaryName, idx);
+                this._ensureDiaryDateIndexCached(diaryName);
+                return idx;
+            } finally {
+                this.indexRecoveryActive = false;
+            }
+        };
+
+        const queuedLoad = this._indexRecoveryTail.then(loadIndex);
+        this._indexRecoveryTail = queuedLoad.catch(error => {
+            console.error(`[KnowledgeBase] Serialized index load failed for "${diaryName}":`, error);
+        });
+        this.diaryIndexLoadPromises.set(diaryName, queuedLoad);
+
+        try {
+            return await queuedLoad;
+        } finally {
+            if (this.diaryIndexLoadPromises.get(diaryName) === queuedLoad) {
+                this.diaryIndexLoadPromises.delete(diaryName);
+            }
+        }
     }
 
     async _loadOrBuildIndex(fileName, capacity, tableType, filterDiaryName = null) {
@@ -2020,11 +2241,48 @@ class KnowledgeBaseManager {
                                 return;
                             }
 
-                            const { event, path: filePath } = JSON.parse(jsonPayload);
+                            const payload = JSON.parse(jsonPayload);
+                            const { event, path: filePath } = payload;
+                            if (!filePath || typeof filePath !== 'string') {
+                                console.warn('[KnowledgeBase] Ignored Rust watcher event without a valid path:', payload);
+                                return;
+                            }
+
+                            // 新版 Rust watcher 只提交稳定事件；若运行时加载的是旧二进制，
+                            // generation/stable 不存在时保持兼容，但仍走 JS 稳定检查。
+                            const generation = Number(payload.generation);
+                            const hasStableProtocol =
+                                payload.stable === true &&
+                                Number.isSafeInteger(generation) &&
+                                generation > 0;
+                            const normalizedPath = path.resolve(filePath);
+                            if (hasStableProtocol) {
+                                const lastGeneration = this.watcherPathGenerations.get(normalizedPath) || 0;
+                                if (generation <= lastGeneration) {
+                                    this.staleWatcherEventsDropped++;
+                                    if (this.debugMode) {
+                                        console.log(
+                                            `[KnowledgeBase] Dropped stale watcher event: path=${normalizedPath}, ` +
+                                            `generation=${generation}, latest=${lastGeneration}`
+                                        );
+                                    }
+                                    return;
+                                }
+                                this.watcherPathGenerations.set(normalizedPath, generation);
+                            }
+
                             if (event === 'unlink') {
-                                this._queueDelete(filePath);
-                            } else {
-                                handleFileWithLock(filePath);
+                                // 删除最终裁决同时取消尚未消费的 add/change。
+                                this.pendingFiles.delete(normalizedPath);
+                                this._queueDelete(normalizedPath);
+                            } else if (event === 'add' || event === 'change') {
+                                // 新状态最终裁决同时取消同路径待删除事件。
+                                this.pendingDeletes.delete(normalizedPath);
+                                if (hasStableProtocol) {
+                                    handleFile(normalizedPath);
+                                } else {
+                                    handleFileWithLock(normalizedPath);
+                                }
                             }
                         } catch (err) {
                             console.error('[KnowledgeBase] Failed to parse Rust watcher event:', err);
@@ -2041,6 +2299,9 @@ class KnowledgeBaseManager {
                         ignoreFolders: this.config.ignoreFolders || [],
                         ignorePrefixes: this.config.ignorePrefixes || [],
                         ignoreSuffixes: this.config.ignoreSuffixes || [],
+                        debounceMs: parseInt(process.env.KNOWLEDGEBASE_WATCH_DEBOUNCE_MS, 10) || 350,
+                        stabilityMs: parseInt(process.env.KNOWLEDGEBASE_WATCH_STABILITY_MS, 10) || 150,
+                        stabilityRetries: parseInt(process.env.KNOWLEDGEBASE_WATCH_STABILITY_RETRIES, 10) || 6,
                     }, handleRustEvent);
 
                     this.watcher = rustWatcher;
@@ -2110,7 +2371,7 @@ class KnowledgeBaseManager {
 
     async _flushDeleteBatch() {
         if (this.isProcessingDeletes || this.pendingDeletes.size === 0 || this.databaseCorruptionDetected) return;
-        if (this.rustWriteLease) {
+        if (this.rustWriteLease || this.externalMutationActive || this.indexRecoveryActive) {
             this._deferBatchForRustLease('delete');
             return;
         }
@@ -2146,7 +2407,7 @@ class KnowledgeBaseManager {
 
     async _flushBatch() {
         if (this.isProcessing || this.pendingFiles.size === 0) return;
-        if (this.rustWriteLease) {
+        if (this.rustWriteLease || this.externalMutationActive || this.indexRecoveryActive) {
             this._deferBatchForRustLease('batch');
             return;
         }
@@ -2161,6 +2422,7 @@ class KnowledgeBaseManager {
         try {
             // 1. 解析文件并按日记本分组
             const docsByDiary = new Map(); // Map<DiaryName, Array<Doc>>
+            const unstableFiles = new Set();
             const checkFile = this.db.prepare('SELECT checksum, mtime, size FROM files WHERE path = ?');
 
             await Promise.all(batchFiles.map(async (filePath) => {
@@ -2174,6 +2436,19 @@ class KnowledgeBaseManager {
                     if (row && row.mtime === stats.mtimeMs && row.size === stats.size && this._hasCompleteStoredVectorsForFile(relPath)) return;
 
                     const content = await fs.readFile(filePath, 'utf-8');
+                    const statsAfterRead = await fs.stat(filePath);
+
+                    // 文件真相快照防线：任何写入者（包括尚未接入协调器的外部程序）
+                    // 只要在读取窗口内改变文件，就不能把这次中间态写进 SQLite/向量索引。
+                    if (
+                        stats.size !== statsAfterRead.size ||
+                        stats.mtimeMs !== statsAfterRead.mtimeMs
+                    ) {
+                        unstableFiles.add(filePath);
+                        console.warn(`[KnowledgeBase] 🛡️ File changed while being read; deferring unstable snapshot: "${filePath}"`);
+                        return;
+                    }
+
                     const checksum = crypto.createHash('md5').update(content).digest('hex');
 
                     if (row && row.checksum === checksum && this._hasCompleteStoredVectorsForFile(relPath)) {
@@ -2191,8 +2466,9 @@ class KnowledgeBaseManager {
             }));
 
             if (docsByDiary.size === 0) {
-                // 🛡️ 所有文件均无变更，安全移出队列，防止无限自检循环
+                // 稳定且无变更的文件可安全出队；读取期间变化的文件必须保留并重试。
                 batchFiles.forEach(f => {
+                    if (unstableFiles.has(f)) return;
                     this.pendingFiles.delete(f);
                     this.fileRetryCount.delete(f);
                 });
@@ -2387,7 +2663,7 @@ class KnowledgeBaseManager {
             // 💡 核心修复：在添加新向量之前，先从 Vexus 索引中移除所有旧的向量
             if (deletions && deletions.size > 0) {
                 for (const [dName, chunkIds] of deletions) {
-                    const idx = await this._getOrLoadDiaryIndex(dName);
+                    const idx = await this._getOrLoadDiaryIndex(dName, { allowJsProcessing: true });
                     if (idx && idx.remove) {
                         chunkIds.forEach(id => {
                             try {
@@ -2423,7 +2699,7 @@ class KnowledgeBaseManager {
 
             // 🛠️ 修复：针对 Diary Index 的安全写入
             for (const [dName, chunks] of updates) {
-                const idx = await this._getOrLoadDiaryIndex(dName);
+                const idx = await this._getOrLoadDiaryIndex(dName, { allowJsProcessing: true });
 
                 chunks.forEach(u => {
                     try {
@@ -2452,6 +2728,7 @@ class KnowledgeBaseManager {
 
             // 5. ✅ 成功处理后，移除文件并清空重试计数
             batchFiles.forEach(f => {
+                if (unstableFiles.has(f)) return;
                 this.pendingFiles.delete(f);
                 this.fileRetryCount.delete(f); // 清空重试计数
             });
@@ -2628,7 +2905,7 @@ class KnowledgeBaseManager {
                     continue;
                 }
 
-                const idx = await this._getOrLoadDiaryIndex(diaryName);
+                const idx = await this._getOrLoadDiaryIndex(diaryName, { allowJsDeleteProcessing: true });
                 if (idx && idx.remove) {
                     chunkIds.forEach(id => {
                         try {
@@ -2955,7 +3232,14 @@ class KnowledgeBaseManager {
                 pendingDeletes: this.pendingDeletes.size,
                 saveTimers: this.saveTimers.size,
                 isProcessing: this.isProcessing,
-                isProcessingDeletes: this.isProcessingDeletes
+                isProcessingDeletes: this.isProcessingDeletes,
+                externalMutationActive: this.externalMutationActive,
+                externalMutationOwner: this.externalMutationOwner,
+                externalMutationQueueLength: this.externalMutationQueueLength,
+                indexRecoveryActive: this.indexRecoveryActive,
+                diaryIndexLoadsInFlight: this.diaryIndexLoadPromises.size,
+                watcherTrackedGenerations: this.watcherPathGenerations.size,
+                staleWatcherEventsDropped: this.staleWatcherEventsDropped
             },
             tagIndex: {
                 stats: tagIndexStats,
@@ -2983,6 +3267,8 @@ class KnowledgeBaseManager {
 
     async shutdown() {
         console.log('[KnowledgeBase] shutting down...');
+        await this._externalMutationTail;
+        await this._indexRecoveryTail;
         if (this.watcher) {
             if (this.watcherType === 'rust') {
                 const stopWatch = this.watcher.stopWatch || this.watcher.stop_watch;
@@ -2994,6 +3280,7 @@ class KnowledgeBaseManager {
             }
             this.watcher = null;
         }
+        this.watcherPathGenerations.clear();
         if (this.ragParamsWatcher) {
             this.ragParamsWatcher.close();
             this.ragParamsWatcher = null;

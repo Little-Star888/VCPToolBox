@@ -78,6 +78,12 @@ export interface WatcherConfig {
   ignoreSuffixes: Array<string>
   /** 可选扩展名白名单。为空时保持旧行为：仅监听 .md / .txt。 */
   extensions?: Array<string>
+  /** 路径事件静默窗口。窗口内的新事件会使旧 generation 自动失效。 */
+  debounceMs?: number
+  /** 两次文件元数据采样之间的稳定确认间隔。 */
+  stabilityMs?: number
+  /** 同一 generation 内最多执行的稳定采样次数。 */
+  stabilityRetries?: number
 }
 /** 核心索引结构 (无状态，只存向量) */
 export declare class VexusIndex {
